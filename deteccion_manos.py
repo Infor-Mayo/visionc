@@ -1,7 +1,7 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from collections import defaultdict
+import random
 
 BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
@@ -45,6 +45,27 @@ face_options = FaceLandmarkerOptions(
 hand_landmarker = HandLandmarker.create_from_options(hand_options)
 face_landmarker = FaceLandmarker.create_from_options(face_options)
 
+# --- YOLO ---
+with open("coco.names", "r") as f:
+    coco_classes = [line.strip() for line in f.readlines()]
+
+colors = {}
+for cls in coco_classes:
+    colors[cls] = (random.randint(50, 255), random.randint(50, 255), random.randint(50, 255))
+
+yolo_net = cv2.dnn.readNetFromDarknet("yolov4-tiny.cfg", "yolov4-tiny.weights")
+yolo_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+yolo_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+layer_names = yolo_net.getLayerNames()
+output_layers = [layer_names[i - 1] for i in yolo_net.getUnconnectedOutLayers().flatten()]
+
+CONF_THRESH = 0.4
+NMS_THRESH = 0.5
+frame_count = 0
+DETECT_EVERY = 3
+yolo_detections = []
+
 FINGER_INFO = [
     ("THUMB", HandLandmarksConnections.HAND_THUMB_CONNECTIONS, 4, None),
     ("INDEX", HandLandmarksConnections.HAND_INDEX_FINGER_CONNECTIONS, 8, 6),
@@ -59,9 +80,41 @@ def is_finger_up(hand_landmarks, finger):
         return hand_landmarks[tip].x < hand_landmarks[tip - 1].x
     return hand_landmarks[tip].y < hand_landmarks[pip].y
 
+def detect_objects(image):
+    blob = cv2.dnn.blobFromImage(image, 1/255.0, (320, 320), swapRB=True, crop=False)
+    yolo_net.setInput(blob)
+    outputs = yolo_net.forward(output_layers)
+    h, w = image.shape[:2]
+    boxes, confs, class_ids = [], [], []
+    for out in outputs:
+        for det in out:
+            scores = det[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > CONF_THRESH:
+                cx, cy, bw, bh = det[:4] * np.array([w, h, w, h])
+                x = int(cx - bw / 2)
+                y = int(cy - bh / 2)
+                boxes.append([x, y, int(bw), int(bh)])
+                confs.append(float(confidence))
+                class_ids.append(class_id)
+    idxs = cv2.dnn.NMSBoxes(boxes, confs, CONF_THRESH, NMS_THRESH)
+    results = []
+    if len(idxs) > 0:
+        for i in idxs.flatten():
+            x, y, bw, bh = boxes[i]
+            cls = coco_classes[class_ids[i]]
+            results.append({
+                "class": cls,
+                "conf": confs[i],
+                "box": (x, y, x + bw, y + bh),
+                "center": (x + bw // 2, y + bh // 2)
+            })
+    return results
+
 cap = cv2.VideoCapture(0)
 print("Presiona 'q' para salir.")
-print("Dedos activos en VERDE, dedos doblados en ROJO.")
+print("Dedos activos en VERDE, dedos doblados en ROJO. YOLO activo.")
 
 while cap.isOpened():
     success, image = cap.read()
@@ -77,6 +130,19 @@ while cap.isOpened():
 
     hand_landmarker.detect_async(mp_image, timestamp)
     face_landmarker.detect_async(mp_image, timestamp)
+
+    frame_count += 1
+    if frame_count % DETECT_EVERY == 0:
+        yolo_detections = detect_objects(image)
+
+    for det in yolo_detections:
+        x1, y1, x2, y2 = det["box"]
+        color = colors[det["class"]]
+        cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
+        label = f"{det['class']} ({det['conf']:.2f})"
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(image, (x1, y1 - th - 8), (x1 + tw, y1), color, -1)
+        cv2.putText(image, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
     # --- FACE MESH ---
     if resultado_cara and resultado_cara.face_landmarks:
@@ -147,10 +213,21 @@ while cap.isOpened():
             cx = int(np.mean([lm.x for lm in hand_landmarks]) * w)
             cy = int(np.mean([lm.y for lm in hand_landmarks]) * h)
             label = "Izquierda" if resultado_manos.handedness[idx][0].category_name == "Left" else "Derecha"
-            cv2.putText(image, f'{label}: {total_fingers}', (cx - 60, cy),
+
+            objeto_cerca = ""
+            for det in yolo_detections:
+                x1b, y1b, x2b, y2b = det["box"]
+                if x1b <= cx <= x2b and y1b <= cy <= y2b:
+                    objeto_cerca = det["class"]
+                    break
+
+            texto = f'{label}: {total_fingers}'
+            if objeto_cerca:
+                texto += f' [{objeto_cerca}]'
+            cv2.putText(image, texto, (cx - 60, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
 
-    cv2.imshow('Deteccion de Manos, Gestos y Expresiones', image)
+    cv2.imshow('Deteccion de Manos, Gestos y Expresiones + YOLO', image)
 
     if cv2.waitKey(5) & 0xFF == ord('q'):
         break
